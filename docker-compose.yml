@@ -1,0 +1,128 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL with pgvector ────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: studypilot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: studypilot
+      POSTGRES_PASSWORD: studypilot
+      POSTGRES_DB: studypilot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studypilot -d studypilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - studypilot-net
+
+  # ── Redis (Celery broker + result backend) ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: studypilot-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - studypilot-net
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: studypilot-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://studypilot:studypilot@postgres:5432/studypilot
+      DATABASE_URL_SYNC: postgresql://studypilot:studypilot@postgres:5432/studypilot
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - studypilot-net
+
+  # ── Celery Worker ───────────────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: studypilot-celery
+    restart: unless-stopped
+    command: celery -A tasks:celery_app worker --loglevel=info --concurrency=2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL_SYNC: postgresql://studypilot:studypilot@postgres:5432/studypilot
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks:celery_app inspect ping --timeout 10"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    networks:
+      - studypilot-net
+
+  # ── React Frontend ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: studypilot-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+      VITE_WS_BASE_URL: ws://localhost:8000
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - studypilot-net
+
+volumes:
+  pgdata:
+    driver: local
+
+networks:
+  studypilot-net:
+    driver: bridge
